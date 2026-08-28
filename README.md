@@ -133,4 +133,4 @@ Telegram intake for text and voice, multilingual conversation with standardised 
 
 ## Acknowledgements
 
-Supervised by Dr. Rubén and Isaac, with clinical input from the Severe Asthma Unit, Hospital Clínic de Barcelona.
+Supervised by Dr. Isaac Cano Franco and Dr. Rubén González Colom, at Institut d'Investigacions Biomèdiques August Pi i Sunyer (IDIBAPS) with clinical input from the Severe Asthma Unit, Hospital Clínic de Barcelona.
