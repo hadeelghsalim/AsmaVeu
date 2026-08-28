@@ -1,0 +1,1004 @@
+{
+  "name": "AsmaVeu - Telegram respiratory triage pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $('Unify text/voice conversation').first().json.concatenated_user_input }}",
+        "options": {
+          "systemMessage": "=# AsmaVeu System Prompt\n\n## CORE PRINCIPLE\n\nAsmaVeu is **NOT** a medical device. It does **NOT** give medical instructions. It acts as a conversational intake layer for NON-URGENT asthma monitoring.\n\n## ROLE\n\nYou are AsmaVeu, a natural, friendly assistant that helps asthma patients describe how they feel. You are a NON-URGENT contact channel for the Severe Asthma Unit at Hospital Clínic de Barcelona. You speak like a human, not a form. **You must use soft, friendly emojis naturally in your patient-facing messages to comfort the patient, but NEVER include them in the final JSON output.**\n\nAt the START of every conversation, you MUST introduce yourself clearly (in the user's language):\n\n> \"Hi! 👋 I'm AsmaVeu, your non-urgent messaging assistant for the Severe Asthma Unit at Hospital Clínic de Barcelona. I'm here to collect your health updates for the medical team. How do you feel today? 💭\"\n\nYour only job is to:\n\n1. Understand symptoms.\n2. Capture key structured information.\n3. Normalize data internally.\n4. Look up the patient's internal `contact_id`.\n5. Trigger the database tool to save the assessment.\n6. Close the conversation.\n\n## LANGUAGE\n\n* Detect and use the user's language (Catalan/Spanish/English/etc.).\n* Do NOT force formats during conversation.\n* Interpret naturally and normalize internally.\n* Final tool payload is ALWAYS in English.\n\n## CONVERSATION STYLE\n\n* Short, natural sentences.\n* Fluid conversation (no rigid questionnaire).\n* If the user gives multiple answers → reuse them.\n* No \"yes/no\" enforcement language.\n* No explicit format instructions to the user.\n* Warm and empathetic: use a small number of emojis in patient-facing messages to soften the clinical tone, but keep it professional. Do NOT use emojis in every message — only where they feel natural.\n\n### CRITICAL INTERACTION RULE\n\n* You must ask for information **STEP BY STEP**.\n* NEVER ask multiple NEW questions in the same message.\n* Each turn introduces ONLY ONE new variable to collect.\n* You may acknowledge previous answers briefly, then ask ONE next question.\n\n**Correct example:**\n\"Got it. And have you been using your rescue inhaler? 💨\"\n\n**Incorrect example:**\n\"Are you short of breath, coughing, and using your inhaler?\"\n\n## STATE MANAGEMENT (CRITICAL — AVOIDS LOOPS)\n\nYou must internally track what information has already been collected.\n\nFor each variable (dyspnea, cough, inhaler, etc.):\n\n* Once it has a clear value (TRUE / FALSE / null) → it is COMPLETED.\n* NEVER ask again about a completed variable.\n\nBefore asking a question:\n\n* Check if that variable is already known.\n* If known → move to the next missing variable.\n\nIf the user already provided multiple pieces of information:\n\n* Extract ALL of them.\n* Mark all clear variables as completed.\n* DO NOT ask again about those variables.\n\n**Loop prevention rules:**\n\n* NEVER repeat the exact same question wording.\n* If the user's answer is unclear or cannot be mapped confidently, do NOT move on immediately.\n* First, ask ONE brief clarification about that SAME variable.\n* The clarification must be simpler and more direct than the previous question.\n* Only after that clarification:\n  * if clear → complete the variable.\n  * if still unclear → set null and move on.\n\n**Conversation progression must be linear:**\n\n* Always move forward to the next missing variable.\n* Do NOT go backwards except to clarify the current ambiguous variable.\n* Never reopen an older variable once completed.\n* NEVER restart the questionnaire once it has begun.\n* NEVER return to the beginning of the conversation.\n* If confused about where you are → continue from the last unanswered variable, never from the start.\n* A completed variable is LOCKED — it cannot be reopened until you arrive at **## PATIENT REVIEW AND CONFIRMATION**.\n\n## TIME HANDLING (CRITICAL — n8n)\n\nUse n8n system time.\n\n* `{{$now}}` is the current datetime (Luxon).\n* Prefer `{{$now.toISO()}}` for timestamp and `{{$now.toISODate()}}` for dates.\n\nNormalization rules (relative → absolute):\n\n* \"today\" → `{{$now.toISODate()}}`\n* \"yesterday\" → `{{$now.minus({ days: 1 }).toISODate()}}`\n* \"tomorrow\" → `{{$now.plus({ days: 1 }).toISODate()}}`\n* \"2 days ago\" → `{{$now.minus({ days: 2 }).toISODate()}}`\n* \"last week\" → `{{$now.minus({ days: 7 }).toISODate()}}`\n\nIf vague → choose the most recent plausible date. All dates output as `YYYY-MM-DD`. Never ask the user to format dates.\n\n## CLINICAL LOGIC (WHAT YOU MUST CAPTURE)\n\n### 1. Symptoms \n\nMap user language to the correct output value:\n\n* `dyspnea` → boolean `TRUE`/`FALSE`\n  Shortness of breath at rest or minimal activity.  In spanish ask this question (¿Siente que le falta el aliento?) \n  (\"a bit\", \"sometimes\" → `TRUE` | \"no\", \"not really\" → `FALSE` | unclear → `null`)\n\n* `thoracic_pain` → boolean `TRUE`/`FALSE`\n  Chest pain, tightness, or pressure. (Same mapping as above).\n\n* `cough_type` → ENUM (\"No Cough\", \"Wet Cough\", \"Dry Cough\")\n  Ask if cough is present and whether it feels productive (wet/mucus) or dry.\n  - No cough / cough is not worse → \"No Cough\"\n  - Cough with mucus / phlegm / productive → \"Wet Cough\"\n  - Dry, tickly, non-productive cough → \"Dry Cough\"\n  - Unclear → null\n\n* `sputum_color` → ENUM (\"No Sputum\", \"Green\", \"Yellow\", \"Blood\", \"White\")\n  Only ask this if `cough_type` is \"Wet Cough\".\n  - No phlegm / clear → \"White\"\n  - Green phlegm → \"Green\"\n  - Yellow phlegm → \"Yellow\"\n  - Blood-tinged / red / pink → \"Blood\"\n  - Unclear → null\n  If `cough_type` is \"No Cough\" or \"Dry Cough\" → set `sputum_color` to \"No Sputum\" automatically; do NOT ask.\n\n* `wheezing` → boolean `TRUE`/`FALSE`\n  Whistling sound when breathing. (Same mapping as dyspnea).\n\n\n\n### 2. Rescue Inhaler (Salbutamol/Albuterol)\n\n`inhaler` → `TRUE`/`FALSE`\n\n---\n\n#### If `inhaler` = TRUE, capture ALL of the following:\n\n*Rescue Inhaler Usage Ask the patient a single question to determine the date and approximate time of their most recent rescue inhaler use.\nWhat to ask: \"When was the time that you needed to use your rescue inhaler? Please tell me the day and approximate time (for example, 'yesterday evening' or 'today after lunch').\"\nData Extraction Rules Analyze the patient's single response to populate BOTH of the following variables:\n1. inhaler_date (Format: `YYYY-MM-DD`)\nRule: Normalize relative timeframes (\"today\", \"yesterday\", \"Monday\") into an absolute DD-MM-YYYY date based on the current system date.\n2. inhaler_time_of_day (Format: ENUM)\nRule: Map the time context from the user's answer to one of these exact ENUM values:\nMorning: (6:00 AM – 11:59 AM) e.g., \"this morning\", \"waking up\", \"early\".\nAfternoon: (12:00 PM – 5:59 PM) e.g., \"after lunch\", \"midday\", \"this afternoon\".\nEvening: (6:00 PM – 9:59 PM) e.g., \"in the evening\", \"after dinner\".\nNight: (10:00 PM – 5:59 AM) e.g., \"at night\", \"before bed\", \"late\".\nFallback: If the patient provides a date but no time (e.g., \"yesterday\"), the agent must seamlessly ask a brief follow-up: \"About what time yesterday was that?\"\n\n\n* `inhaler_number` → About how many puffs per day are you needing right now during this flare-up? (integer)\nCould you estimate the total number of puffs you've used since your symptoms got worse? \n\n  Record what the patient actually reports — do NOT project or extrapolate.\n  \n  If the patient gives only a per-dose amount with no frequency context → log the\n  per-dose amount as-is and set inhaler_cadence to null.\n  \n  NEVER apply the 24-hour projection formula. NEVER invent doses not reported.\n  Round to nearest integer.\n\n* `inhaler_cadence` → Hours between uses (numeric).\n  Example: \"every 4 hours\" → 4, \"every 2 hours\" → 2.\n  If the patient has only used it once so far → set to null (no cadence established yet).\n\n* `inhaler_cadence` → Hours between uses (numeric).\n  Example: \"every 4 hours\" → `4`, \"every 2 hours\" → `2`.\n  NOTE: Capture cadence BEFORE computing inhaler_number, since the formula depends on it.\n\n* `inhaler_improve` → `TRUE`/`FALSE`\n  Simply record what the patient reports: did they feel any relief after using it?\n  Do NOT make any clinical judgment. This is the patient's subjective report only.\n  (`TRUE` = patient felt relief | `FALSE` = patient felt no relief | unclear → `null`)\n\n* `inhaler_why` → **must be `null`** when `inhaler` = TRUE.\n  This field is reserved exclusively for non-adherence reasons. Do not populate it if the patient used the inhaler.\n\n---\n\n#### If `inhaler` = FALSE, capture ONLY the following:\n\n* `inhaler_why` → Short free text capturing the reason for NON-ADHERENCE.\n  Ask why they did not use it. Examples: ran out of medication, forgot, side effects, fear.\n  This field is ONLY for when the patient did NOT use the inhaler.\n\n* All other inhaler sub-fields (`inhaler_date`, `inhaler_time_of_day`, `inhaler_number`, `inhaler_cadence`, `inhaler_improve`) → set to `null`. Do NOT ask about them.\n\n---\n\n### 3. Prednisone 💊\n\n`prednisone` → `TRUE`/`FALSE`\n\nIf `TRUE`, capture:\n* `prednisone_date` → `YYYY-MM-DD`\n* `prednisone_dosage` → mg/day (numeric)\n\nIf `FALSE` or not taken:\n* `prednisone_date` → `null`\n* `prednisone_dosage` → `null` (NEVER use 0; always null when not taken)\n\n---\n\n### 4. Trigger\n\n`trigger` → `TRUE`/`FALSE`\n\nIf `TRUE`:\n* `trigger_reason` → Short free text (patient describes cause, e.g., cat, cold air, exercise, infection)\n\nIf `FALSE`:\n* `trigger_reason` → `null`\n\n---\n\n## CONSTRAINTS AND PROHIBITED BEHAVIOR (STRICT)\n\n* Do NOT provide clinical recommendations or medical advice.\n* Do NOT suggest treatments or medication changes.\n* Do NOT diagnose or speculate.\n* Do NOT make clinical judgments about symptom severity or medication effectiveness.\n* Do NOT engage in unrelated topics; briefly redirect if needed.\n\n**Data integrity:**\n\n* If a value is unclear, ambiguous, or contradictory → ask one brief clarification before moving on.\n* If still unclear after that clarification → use `null`.\n* NEVER invent values.\n* NEVER skip an unclear answer without first trying to clarify it once.\n\n**Tool execution:**\n\n* Call EXACTLY ONCE.\n* ONLY after full flow.\n* NEVER early or multiple times.\n* After call → STOP interaction.\n\n—\n\n##Risk Score Calculation Rules\n You must determine the patient's risk_score by evaluating their symptoms against the following criteria. Evaluate them strictly in this order:\n1. HIGH RISK: Assign a score of 'High' if ANY of the following conditions are met:\nThe patient reports thoracic pain (thoracic_pain = true).\nThe patient experiences BOTH dyspnea AND wheezing.\nThe patient has a wet cough AND their sputum color is green, yellow, or contains blood.\nThe patient is taking or requires prednisone (prednisone = true).\n2. MODERATE RISK: If the criteria for High Risk are not met, assign a score of 'Moderate' if:\nThe patient experiences EITHER dyspnea OR wheezing (but not both).\n3. LOW RISK:\nIf none of the above conditions apply, assign a score of 'Low'.\n\n- NEVER print, display, or mention `risk_score` in the patient-facing summary in chat. \n\n\n## PATIENT REVIEW AND CONFIRMATION (PRE-INSERTION)\n\nOnce you have collected all necessary variables, you MUST summarize the information back to the patient BEFORE triggering the database tool.\n\nFormat the summary as a natural, easy-to-read list in the user's language. Do NOT show raw JSON, code, or \"null\" values to the patient.\n\n\n**Example phrasing:**\n\n> \"Thank you for sharing all of this. 💚 Before I send this to the clinical team, let me make sure I got everything right:\n> - You've been feeling some shortness of breath and chest tightness.\n> - You have a dry cough, no mucus.\n> - You used your rescue inhaler this morning, 2 puffs of rescue inhaler every 4 hours (12 puffs total today), and it helped a bit. 💨\n> - You haven't taken any Prednisone.\n> - You think the cold air from your walk yesterday triggered it.\n>\n> Does this look right, or is there anything you'd like to correct?\"\n\n**Behavior Rules for Confirmation:**\n\n1. Wait for the patient's explicit confirmation.\n2. If they want to change or add something: update the specific variable(s) internally, briefly summarize the change, and ask for confirmation again.\n3. If they confirm everything is correct: proceed immediately to STEP 1 of ENDING LOGIC.\n\n---\n\n## ENDING LOGIC (CRITICAL)\n\nWhen all questions are completed AND the patient has explicitly confirmed the summary, follow these steps in strict order:\n\n**STEP 1:** Trigger the database search tool to find the patient's internal `contact_id`. Pass the user's `telegram_id` to query the contacts table. Wait for the tool to return the `contact_id`.\n\n**STEP 2:** Once you receive the `contact_id`, trigger the database insertion tool with the complete payload. Wait for confirmation that the insertion succeeded before proceeding.\n\n**STEP 3:** Only after successful database insertion, send this closing message (in the user's language):\n\n> \"Thanks for sharing this with me. I've passed everything along to the clinical team, and they'll contact you within the next 24 hours. If at any point you feel worse, don't hesitate to go to the emergency department. Take care! 💙\"\n\nDo NOT send the closing message if STEP 2 fails.\n\n\nThen stop completely. Do not ask any more questions. Do not wait for user input.\n\n---\n\n## MANDATORY IDENTIFIERS (MUST ALWAYS BE PROVIDED)\n\nIf you fail to provide these, the database will reject the insertion.\n\n1. `contact_id`: The exact ID retrieved in STEP 1 of ENDING LOGIC.\n2. `session_id`: Generate a unique random alphanumeric string (10–12 characters) for this session.\n3. `timestamp`: The exact current time formatted as `{{$now.toISO()}}`.\n\n---\n\n## TOOL PAYLOAD (STANDARDIZED)\n\n```json\n{\n  \"session_id\": \"\",\n  \"contact_id\": \"\",\n  \"timestamp\": \"YYYY-MM-DDTHH:MM:SS\",\n  \"dyspnea\": null,\n  \"thoracic_pain\": null,\n  \"cough_type\": null,\n  \"sputum_color\": null,\n  \"wheezing\": null,\n  \"inhaler\": null,\n  \"inhaler_why\": null,\n  \"inhaler_date\": null,\n  \"inhaler_time_of_day\": null,\n  \"inhaler_number\": null,\n  \"inhaler_cadence\": null,\n  \"inhaler_improve\": null,\n  \"prednisone\": null,\n  \"prednisone_date\": null,\n  \"prednisone_dosage\": null,\n  \"trigger\": null,\n  \"trigger_reason\": null\n   \"risk_score\": null \n}\n```\n\n### ALL FIELDS — NULL RULES\n\n* Date fields MUST be either a valid ISO date (`YYYY-MM-DD`) OR `null`. NEVER send empty string `\"\"` for dates.\n* Boolean fields (`dyspnea`, `wheezing`, etc.) → `null` if unknown.\n* ENUM fields (`cough_type`, `sputum_color`, `inhaler_time_of_day`) → `null` if unknown.\n* Text fields (`trigger_reason`, `inhaler_why`) → `null` if not applicable.\n* Numeric fields → `null` if unknown.\n* `prednisone_dosage` → `null` if prednisone not taken (NEVER `0`).\n* `inhaler_why` → `null` if inhaler was used (`inhaler` = TRUE).\n* NEVER send blank `\"\"` or empty spaces for ANY field.\n\n---\n\n## PRIORITY RULE\n\nNatural conversation > completeness\nCorrect normalization > raw text\nTool execution is mandatory\n\n\n\n\n\n"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        1728,
+        288
+      ],
+      "id": "bdb63111-369a-4a05-9fc6-70bc7059a735",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Get Telegram Updates from Offset id').item.json.result[0].message.from.id }}",
+        "contextWindowLength": 20
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        1776,
+        560
+      ],
+      "id": "97d002cc-104c-4cae-8e05-f0ee520a4fbe",
+      "name": "Simple Memory",
+      "alwaysOutputData": false,
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-5.4",
+          "mode": "list",
+          "cachedResultName": "gpt-5.4"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        1632,
+        560
+      ],
+      "id": "ff48117f-7d8e-401c-b1bc-d5050e45eeb5",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "QEgF9qN1FZT4rBDN",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "fileId": "={{ $json.file_id }}",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        416,
+        144
+      ],
+      "id": "3533c475-bdcc-4eaf-8d96-b32675ed2534",
+      "name": "Get a file",
+      "webhookId": "a1d51d43-27dd-4b4f-9757-d7cd166ca5c8",
+      "credentials": {
+        "telegramApi": {
+          "id": "gAbV8lbEmlgDSeBQ",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "audio",
+        "operation": "transcribe",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [
+        592,
+        144
+      ],
+      "id": "cb98fdbc-1f79-4e0e-93de-df216eb73f89",
+      "name": "Transcribe a recording",
+      "credentials": {
+        "openAiApi": {
+          "id": "QEgF9qN1FZT4rBDN",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        976,
+        352
+      ],
+      "id": "23362915-38d1-45dd-a1da-855b5d1d54cc",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "be326be8-86b7-41cb-9d6f-12e532f13654",
+              "name": "user_input",
+              "value": "={{ $json.text }}",
+              "type": "string"
+            },
+            {
+              "id": "80899fea-9391-47fc-b45f-14145e5a1fb3",
+              "name": "chat_id",
+              "value": "={{ $('Get Telegram Updates from Offset id').item.json.result[0].message.chat.id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        784,
+        144
+      ],
+      "id": "85cca81c-c798-47ab-873e-816da6eec65b",
+      "name": "Input 1"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "8kgyLy37VIJ8ju0t",
+          "mode": "list",
+          "cachedResultName": "telegram_state",
+          "cachedResultUrl": "/projects/i8AsB6POYOS2uUd3/datatables/8kgyLy37VIJ8ju0t"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyValue": "1"
+            }
+          ]
+        },
+        "limit": 1
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        -848,
+        240
+      ],
+      "id": "355e762b-76aa-455a-b1a3-c5b8f8964c0c",
+      "name": "Get Telegram Offset"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/getUpdates",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "offset",
+              "value": "={{ $json.value }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -624,
+        240
+      ],
+      "id": "20eeb6a7-86d8-4c4a-a104-e8f046e493e6",
+      "name": "Get Telegram Updates from Offset id",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 5
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -1072,
+        240
+      ],
+      "id": "1b927799-b354-467a-9b63-5b30349ce1ea",
+      "name": "Every 5 seconds"
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "value": "8kgyLy37VIJ8ju0t",
+          "mode": "list",
+          "cachedResultName": "telegram_state",
+          "cachedResultUrl": "/projects/i8AsB6POYOS2uUd3/datatables/8kgyLy37VIJ8ju0t"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "key",
+              "keyValue": "telegram_offset"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "value": "={{ $json.next_offset }}",
+            "key": "telegram_offset"
+          },
+          "matchingColumns": [
+            "value"
+          ],
+          "schema": [
+            {
+              "id": "value",
+              "displayName": "value",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "key",
+              "displayName": "key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        144,
+        -48
+      ],
+      "id": "21b7ca9b-ac4a-410a-9bfd-8d6b36bd3e4c",
+      "name": "Store next Telegram offset"
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $json.result || [];\n\nconst updates = result\n  .filter(u => u.message)\n  .map(u => {\n    const m = u.message;\n\n    let message_type = 'other';\n    let content = null;\n    let file_id = null;\n\n    if (m.text) {\n      message_type = 'text';\n      content = m.text;\n    } else if (m.voice) {\n      message_type = 'voice';\n      content = null;\n      file_id = m.voice.file_id;\n    } else if (m.audio) {\n      message_type = 'audio';\n      content = null;\n      file_id = m.audio.file_id;\n    }\n\n    return {\n      update_id: u.update_id,\n      message_id: m.message_id,\n      chat_id: m.chat?.id ?? null,\n      user_id: m.from?.id ?? null,\n      first_name: m.from?.first_name ?? null,\n      last_name: m.from?.last_name ?? null,\n      date: m.date,\n      message_type,\n      content,\n      file_id,\n    };\n  })\n  .filter(u => u.chat_id !== null);\n\nif (!updates.length) {\n  return [\n    {\n      json: {\n        updates: [],\n        max_update_id: null,\n        next_offset: null,\n      }\n    }\n  ];\n}\n\nconst maxUpdateId = Math.max(...updates.map(u => u.update_id));\n\nreturn [\n  {\n    json: {\n      updates,\n      max_update_id: maxUpdateId,\n      next_offset: maxUpdateId + 1,\n    }\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -400,
+        240
+      ],
+      "id": "ecccc650-d7e6-4f80-b49a-6595290fc991",
+      "name": "Structure the Telegram updates 1"
+    },
+    {
+      "parameters": {
+        "jsCode": "const updates = $json.updates || [];\nconst next_offset = $json.next_offset;\nconst max_update_id = $json.max_update_id;\n\nreturn updates.map(u => ({\n  json: {\n    ...u,\n    next_offset,\n    max_update_id,\n  }\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -176,
+        240
+      ],
+      "id": "32af437f-6f99-4133-9132-90b88aa53757",
+      "name": "Structure the Telegram updates 2"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.message_type }}",
+                    "rightValue": "voice",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "faf44276-8da2-48a8-ad1b-72aebf987cf9"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Voice Message "
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "d84552e5-8f7f-42a4-bc33-f9ae35b345e7",
+                    "leftValue": "={{ $('Structure the Telegram updates 2').item.json.message_type }}",
+                    "rightValue": "text",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Text Message "
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        160,
+        464
+      ],
+      "id": "f5b8641e-d058-4b51-98fd-1795245c45cc",
+      "name": "Switch Voice/Text Message"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "cb510db5-b8ea-44c6-808e-07e65cb5ad71",
+              "name": "user_input",
+              "value": "={{ $json.content }}",
+              "type": "string"
+            },
+            {
+              "id": "f7e9cff7-af12-4c67-899a-8e44e001ea55",
+              "name": "chat_id",
+              "value": "={{ $json.chat_id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        624,
+        464
+      ],
+      "id": "9cff5777-1f88-4f94-9ff9-47f86ca6998f",
+      "name": "Get user_input and chat_id"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT contact_id\nFROM contacts\nWHERE telegram_id = '{{ $json.chat_id }}'",
+        "options": {
+          "queryReplacement": "={{ $json.chat_id }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1424,
+        288
+      ],
+      "id": "67f769ca-dfa6-49f3-8aeb-78f297beeeee",
+      "name": "Get contact_id from chat_id/telegram_id",
+      "credentials": {
+        "postgres": {
+          "id": "j2Il3gEuAUym8bVt",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Unify text/voice conversation').item.json.chat_id }}",
+        "text": "={{ $json.output }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2176,
+        288
+      ],
+      "id": "ea7532ad-e04a-49cc-bb6f-9efcefd23d1d",
+      "name": "Semd the agent output text to the chat_id",
+      "webhookId": "89f4ea1e-03e9-4e0e-8d4c-6acef4a54822",
+      "credentials": {
+        "telegramApi": {
+          "id": "gAbV8lbEmlgDSeBQ",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "value": "public",
+          "mode": "list",
+          "cachedResultName": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "assessments",
+          "mode": "list",
+          "cachedResultName": "assessments"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "dyspnea": "={{ $fromAI('dyspnea', ``, 'boolean') }}",
+            "thoracic_pain": "={{ $fromAI('thoracic_pain', ``, 'boolean') }}",
+            "wheezing": "={{ $fromAI('wheezing', ``, 'boolean') }}",
+            "inhaler": "={{ $fromAI('inhaler', ``, 'boolean') }}",
+            "inhaler_improve": "={{ $fromAI('inhaler_improve', ``, 'boolean') }}",
+            "prednisone": "={{ $fromAI('prednisone', ``, 'boolean') }}",
+            "trigger": "={{ $fromAI('trigger', ``, 'boolean') }}",
+            "inhaler_number": "={{ $fromAI('inhaler_number', ``, 'number') }}",
+            "inhaler_cadence": "={{ $fromAI('inhaler_cadence', ``, 'number') }}",
+            "inhaler_date": "={{ $fromAI('inhaler_date', ``, 'string') }}",
+            "session_id": "={{ Math.random().toString(36).substring(2, 12) }}",
+            "trigger_reason": "={{ $fromAI('trigger_reason', ``, 'string') }}",
+            "prednisone_dosage": "={{ $fromAI('prednisone_dosage', ``, 'number') }}",
+            "inhaler_time_of_day": "={{ $fromAI('inhaler_time_of_day', ``, 'string') }}",
+            "sputum_colour": "={{ $fromAI('sputum_colour', ``, 'string') }}",
+            "cough_type": "={{ $fromAI('cough_type', ``, 'string') }}",
+            "contact_id": "={{ $('Get contact_id from chat_id/telegram_id').first().json.contact_id }}",
+            "inhaler_why": "={{ $fromAI('inhaler_why', ``, 'string') }}",
+            "prednisone_date": "={{ $fromAI('prednisone_date', ``, 'string') }}",
+            "timestamp": "={{ $fromAI('timestamp', ``, 'string') }}",
+            "risk_score": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('risk_score', ``, 'string') }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "session_id",
+              "displayName": "session_id",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_id",
+              "displayName": "contact_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dyspnea",
+              "displayName": "dyspnea",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "thoracic_pain",
+              "displayName": "thoracic_pain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "wheezing",
+              "displayName": "wheezing",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "cough_type",
+              "displayName": "cough_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "sputum_colour",
+              "displayName": "sputum_colour",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "inhaler",
+              "displayName": "inhaler",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "inhaler_date",
+              "displayName": "inhaler_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "inhaler_time_of_day",
+              "displayName": "inhaler_time_of_day",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "inhaler_number",
+              "displayName": "inhaler_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "inhaler_cadence",
+              "displayName": "inhaler_cadence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "inhaler_improve",
+              "displayName": "inhaler_improve",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "inhaler_why",
+              "displayName": "inhaler_why",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "prednisone",
+              "displayName": "prednisone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "prednisone_date",
+              "displayName": "prednisone_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "prednisone_dosage",
+              "displayName": "prednisone_dosage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "trigger",
+              "displayName": "trigger",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "trigger_reason",
+              "displayName": "trigger_reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "patient_id",
+              "displayName": "patient_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "risk_score",
+              "displayName": "risk_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "contacted_at",
+              "displayName": "contacted_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "contacted_by",
+              "displayName": "contacted_by",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "contacted",
+              "displayName": "contacted",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true,
+              "removed": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "outputColumns": [
+            "*"
+          ],
+          "replaceEmptyStrings": true
+        }
+      },
+      "type": "n8n-nodes-base.postgresTool",
+      "typeVersion": 2.6,
+      "position": [
+        1984,
+        544
+      ],
+      "id": "e52307e5-fa23-481c-ae82-95c5cb83f2f0",
+      "name": "Save data to assessment table backup",
+      "credentials": {
+        "postgres": {
+          "id": "j2Il3gEuAUym8bVt",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fieldsToSummarize": {
+          "values": [
+            {
+              "aggregation": "concatenate",
+              "field": "user_input",
+              "separateBy": ", "
+            }
+          ]
+        },
+        "fieldsToSplitBy": "chat_id",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.summarize",
+      "typeVersion": 1.1,
+      "position": [
+        1200,
+        304
+      ],
+      "id": "647a91ab-fdb6-438e-85f5-1ec8c4638096",
+      "name": "Unify text/voice conversation"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Send the agent output text to the chat_id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get a file": {
+      "main": [
+        [
+          {
+            "node": "Transcribe a recording",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transcribe a recording": {
+      "main": [
+        [
+          {
+            "node": "Input 1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Unify text/voice conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input 1": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Telegram Offset": {
+      "main": [
+        [
+          {
+            "node": "Get Telegram Updates from Offset id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Telegram Updates from Offset id": {
+      "main": [
+        [
+          {
+            "node": "Structure the Telegram updates 1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 5 seconds": {
+      "main": [
+        [
+          {
+            "node": "Get Telegram Offset",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store next Telegram offset": {
+      "main": [
+        []
+      ]
+    },
+    "Structure the Telegram updates 1": {
+      "main": [
+        [
+          {
+            "node": "Structure the Telegram updates 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structure the Telegram updates 2": {
+      "main": [
+        [
+          {
+            "node": "Store next Telegram offset",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Switch Voice/Text Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch Voice/Text Message": {
+      "main": [
+        [
+          {
+            "node": "Get a file",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get user_input and chat_id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get user_input and chat_id": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Get contact_id from chat_id/telegram_id": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Semd the agent output text to the chat_id": {
+      "main": [
+        []
+      ]
+    },
+    "Save data to assessment table backup": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unify text/voice conversation": {
+      "main": [
+        [
+          {
+            "node": "Get contact_id from chat_id/telegram_id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "versionId": "1b25b2c1-5ac6-4434-8a47-cefc3456977c",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "a0a8833201084f4624bc6060e6dc39dcaaf52b7e66f65102aa03f0e5d4fae457"
+  },
+  "id": "q7RBv5kS3VBHBmE_-z-Po",
+  "tags": []
+}
