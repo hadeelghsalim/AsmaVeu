@@ -1,6 +1,6 @@
 # AsmaVeu
 
-A conversational triage system for non-urgent asthma symptom monitoring, built for the Severe Asthma Unit at Hospital Clínic de Barcelona.
+A conversational intake system for non-urgent asthma symptom monitoring, built for the Severe Asthma Unit at Hospital Clínic de Barcelona.
 
 Patients report worsening respiratory symptoms to a Telegram bot, by text or voice note, in whichever language they prefer. An LLM agent conducts a structured clinical interview, normalises the answers into English, and writes them to a PostgreSQL database. Nurses review incoming cases on a Metabase dashboard, prioritised by an automatically calculated risk score.
 
