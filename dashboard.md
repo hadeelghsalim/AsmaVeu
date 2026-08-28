@@ -111,16 +111,4 @@ case leaves the outstanding queue
 
 ---
 
-## Known limitations
 
-Documented deliberately — these are current constraints, not oversights.
-
-**Risk ordering is alphabetical.** `risk_score` is stored as `text`, so sorting produces High → Low → Moderate. Moderate cases therefore sort *below* Low ones. Visible in the Mailbox screenshots. A numeric score column for sorting, with the label kept for display, would fix this.
-
-**Risk is occasionally null.** Some historical assessments have no `risk_score` value. Whether the agent intermittently failed to populate the field or the synthetic dataset is incomplete has not yet been established, and is worth resolving before any pilot.
-
-**Duplicate assessments appear.** The same patient shows several identical rows on one date. This may reflect genuine repeat sessions, but exact duplication suggests the workflow inserting more than once per conversation — consistent with the `session_id` uniqueness issue identified during development.
-
-**Column naming is inconsistent.** The trend chart uses `chest_pain` while the database column is `thoracic_pain`, and the tables label it `Thoracic Pain`. Cosmetic, but worth unifying before the figures are finalised.
-
-**Dashboards cannot be version-controlled.** Metabase serialization is a Pro/Enterprise feature, so the dashboard definitions live only inside the Metabase application database. This repository documents them through this file, the SQL in `db/dashboard_queries/`, and the figures in `docs/figures/`. Rebuilding the dashboards on a fresh instance is currently a manual task.
