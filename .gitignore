@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------
+# Secrets and environment — NEVER commit these
+# ---------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.env
+credentials.json
+*.pem
+*.key
+
+# ---------------------------------------------------------------
+# Patient data — this project handles GDPR special-category data.
+# No real or exported clinical data belongs in version control.
+# ---------------------------------------------------------------
+data/
+exports/
+backups/
+*.dump
+*.sql.gz
+*_patients.csv
+*_assessments.csv
+
+# ---------------------------------------------------------------
+# Docker volumes / local service state
+# ---------------------------------------------------------------
+n8n_data/
+postgres_data/
+pgadmin_data/
+metabase_data/
+*.db
+*.sqlite
+*.sqlite3
+
+# ---------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------
+*.log
+logs/
+
+# ---------------------------------------------------------------
+# OS / editor noise
+# ---------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+
+# ---------------------------------------------------------------
+# Python (for any analysis or synthetic-data scripts)
+# ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------
+# Node
+# ---------------------------------------------------------------
+node_modules/
